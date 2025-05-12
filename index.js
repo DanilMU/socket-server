@@ -5,7 +5,16 @@ const cors = require("cors");
 const app = express();
 
 const route = require("./route");
-const { addUser, findUser, getRoomUsers, removeUser } = require("./users");
+const { 
+  addUser, 
+  findUser, 
+  getRoomUsers, 
+  removeUser,
+  addMessageToHistory,
+  getRoomHistory,
+  findUserById,
+  setUserOnlineStatus
+} = require("./users");
 
 app.use(cors({ origin: "*" }));
 app.use(route);
@@ -19,65 +28,191 @@ const io = new Server(server, {
   },
 });
 
+// Middleware для проверки аутентификации
+io.use((socket, next) => {
+  const { token } = socket.handshake.auth;
+  // Здесь можно добавить проверку токена
+  next();
+});
+
 io.on("connection", (socket) => {
+  console.log(`User connected: ${socket.id}`);
+  
+  // Устанавливаем статус онлайн при подключении
+  socket.on("setOnline", ({ userId }) => {
+    setUserOnlineStatus(userId, true);
+    io.emit("userStatusChanged", { userId, isOnline: true });
+  });
+
   socket.on("join", ({ name, room }) => {
+    // Проверка на максимальное количество пользователей в комнате
+    const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
+    if (roomSize >= 100) {
+      socket.emit("error", { message: "Room is full (max 100 users)" });
+      return;
+    }
+
     socket.join(room);
+    const { user, isExist } = addUser({ 
+      name, 
+      room, 
+      id: socket.id,
+      socketId: socket.id
+    });
 
-    const { user, isExist } = addUser({ name, room });
-
-    // Определяем сообщение в зависимости от isExist
+    const timestamp = new Date().toISOString();
     const welcomeMessage = isExist
-      ? `${user.name}, here you go to ${room}`
+      ? `${user.name}, welcome back to ${room}`
       : `Welcome ${user.name} to ${room}`;
 
-    // Отправляем персонализированное сообщение
+    // Отправляем историю сообщений новому пользователю
+    if (!isExist) {
+      const roomHistory = getRoomHistory(room);
+      socket.emit("history", { data: roomHistory });
+    }
+
+    // Системное сообщение для вошедшего пользователя
     socket.emit("message", {
-      data: { user: { name: "Admin" }, message: welcomeMessage },
+      data: { 
+        user: { name: "Admin", id: "system" }, 
+        message: welcomeMessage,
+        timestamp,
+        type: "system"
+      }
     });
 
-    // Уведомляем других пользователей
+    // Уведомление для других пользователей
     socket.broadcast.to(user.room).emit("message", {
       data: {
-        user: { name: "Admin" },
-        message: isExist
-          ? `${user.name} has rejoined the room`
-          : `${user.name} has joined the room`,
-      },
+        user: { name: "Admin", id: "system" },
+        message: isExist 
+          ? `${user.name} has rejoined the chat`
+          : `${user.name} has joined the chat`,
+        timestamp,
+        type: "system"
+      }
     });
 
-    io.to(user.room).emit("room", {
-      data: { users: getRoomUsers(user.room) },
+    // Обновляем список пользователей в комнате
+    io.to(user.room).emit("roomData", {
+      data: { 
+        users: getRoomUsers(user.room),
+        room: user.room 
+      },
     });
   });
 
+  // Обработка обычных сообщений
   socket.on("sendMessage", ({ message, params }) => {
     const user = findUser(params);
     if (user) {
-      io.to(user.room).emit("message", { data: { user, message } });
+      const timestamp = new Date().toISOString();
+      const messageData = {
+        user,
+        message,
+        timestamp,
+        room: user.room
+      };
+      
+      // Сохраняем сообщение в историю
+      addMessageToHistory(user.room, messageData);
+      
+      // Отправляем сообщение всем в комнате
+      io.to(user.room).emit("message", { data: messageData });
     }
   });
 
-  socket.on("leftRoom", ({ params }) => {
+  // Обработка приватных сообщений
+  socket.on("privateMessage", ({ to, message }) => {
+    const fromUser = findUserById(socket.id);
+    const toUser = findUserById(to);
+    
+    if (fromUser && toUser) {
+      const timestamp = new Date().toISOString();
+      const messageData = {
+        from: fromUser,
+        to: toUser,
+        message,
+        timestamp,
+        type: "private"
+      };
+      
+      // Отправляем получателю
+      io.to(toUser.socketId).emit("privateMessage", messageData);
+      // Отправляем отправителю для подтверждения
+      socket.emit("privateMessage", messageData);
+    }
+  });
+
+  // Обработка набора текста
+  socket.on("typing", ({ room, isTyping }) => {
+    const user = findUserById(socket.id);
+    if (user) {
+      socket.broadcast.to(room).emit("typing", {
+        userId: user.id,
+        name: user.name,
+        isTyping
+      });
+    }
+  });
+
+  // Выход из комнаты
+  socket.on("leaveRoom", ({ params }) => {
     const user = removeUser(params);
     if (user) {
-      const { room, name } = user;
-
-      io.to(room).emit("message", {
-        data: { user: { name: "Admin" }, message: `${name} has left` },
+      const timestamp = new Date().toISOString();
+      
+      io.to(user.room).emit("message", {
+        data: { 
+          user: { name: "Admin", id: "system" }, 
+          message: `${user.name} has left the chat`,
+          timestamp,
+          type: "system"
+        }
       });
 
-      io.to(room).emit("room", {
-        data: { users: getRoomUsers(room) },
+      io.to(user.room).emit("roomData", {
+        data: { 
+          users: getRoomUsers(user.room),
+          room: user.room 
+        },
       });
     }
   });
 
+  // Отключение пользователя
   socket.on("disconnect", () => {
-    // Исправлено с io.on на socket.on
-    console.log("User disconnected");
+    const user = findUserById(socket.id);
+    if (user) {
+      const timestamp = new Date().toISOString();
+      
+      setUserOnlineStatus(user.id, false);
+      io.to(user.room).emit("userStatusChanged", { 
+        userId: user.id, 
+        isOnline: false 
+      });
+
+      io.to(user.room).emit("message", {
+        data: { 
+          user: { name: "Admin", id: "system" }, 
+          message: `${user.name} has disconnected`,
+          timestamp,
+          type: "system"
+        }
+      });
+
+      removeUser({ name: user.name, room: user.room });
+      io.to(user.room).emit("roomData", {
+        data: { 
+          users: getRoomUsers(user.room),
+          room: user.room 
+        },
+      });
+    }
+    console.log(`User disconnected: ${socket.id}`);
   });
 });
 
 server.listen(5000, () => {
-  console.log("Server is running");
+  console.log("Server is running on port 5000");
 });
