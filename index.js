@@ -16,6 +16,10 @@ const {
   setUserOnlineStatus
 } = require("./users");
 
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
 app.use(cors({ origin: "*" }));
 app.use(route);
 
@@ -34,6 +38,41 @@ io.use((socket, next) => {
   // Здесь можно добавить проверку токена
   next();
 });
+
+// Создаем папку uploads, если ее нет
+if (!fs.existsSync('./uploads')) {
+  fs.mkdirSync('./uploads');
+}
+
+// Настройка Multer для загрузки файлов
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB
+});
+
+// Маршрут для загрузки файлов
+app.post('/upload', upload.single('file'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+  res.json({ 
+    url: `/uploads/${req.file.filename}`,
+    type: req.file.mimetype.split('/')[0] // audio, video, image
+  });
+});
+
+// Статическая папка для файлов
+app.use('/uploads', express.static('uploads'));
 
 io.on("connection", (socket) => {
   console.log(`User connected: ${socket.id}`);
@@ -103,7 +142,7 @@ io.on("connection", (socket) => {
   });
 
   // Обработка обычных сообщений
-  socket.on("sendMessage", ({ message, params }) => {
+  socket.on("sendMessage", ({ message, params, file }) => {
     const user = findUser(params);
     if (user) {
       const timestamp = new Date().toISOString();
@@ -111,8 +150,13 @@ io.on("connection", (socket) => {
         user,
         message,
         timestamp,
-        room: user.room
+        room: user.room,
+        type: file ? file.type : 'text'
       };
+      
+      if (file) {
+        messageData.file = file;
+      }
       
       // Сохраняем сообщение в историю
       addMessageToHistory(user.room, messageData);
